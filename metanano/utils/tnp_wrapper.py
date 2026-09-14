@@ -39,6 +39,7 @@ Consumers / 调用方:
 """
 
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -48,6 +49,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
 
 
 class TNPResult(BaseModel):
@@ -142,6 +145,7 @@ class TNPWrapper:
         self,
         tnp_executable: str = "TNP",
         temp_dir: Optional[Path] = None,
+        max_attempts: int = 3,
     ) -> None:
         """
         Initialize the TNP wrapper.
@@ -159,6 +163,8 @@ class TNPWrapper:
         """
         self.tnp_executable = tnp_executable
         self.temp_dir = temp_dir
+        self.max_attempts = max(1, int(max_attempts))
+        self._last_error = "unknown"
 
     def _check_tnp_available(self) -> bool:
         """
@@ -196,11 +202,54 @@ class TNPWrapper:
             - metanano/filters/developability.py: DevelopabilityFilter.compute_tnp_profile
         """
         if not self._check_tnp_available():
+            logger.error("TNP executable %r not found on PATH", self.tnp_executable)
             return None
 
+        # TNP delegates structure prediction to NanoBodyBuilder2 (ImmuneBuilder)
+        # on the GPU, and that can fault transiently -- observed as
+        # "RuntimeError: CUDA error: unspecified launch failure". TNP catches it
+        # and exits without a profile. That is a property of the host at that
+        # moment, not of the sequence: the same sequence profiles cleanly on a
+        # retry. Retrying here keeps a transient fault from being reported as a
+        # verdict about the molecule.
+        # TNP 将结构预测委托给 GPU 上的 NanoBodyBuilder2（ImmuneBuilder），
+        # 它可能出现瞬时故障。这是主机当时的状态问题，而非序列的问题：
+        # 同一序列在重试时可以正常分析。
+        for attempt in range(1, self.max_attempts + 1):
+            result = self._run_once(sequence, name, attempt)
+            if result is not None:
+                if attempt > 1:
+                    logger.info("TNP succeeded on attempt %d", attempt)
+                return result
+
+        logger.warning(
+            "TNP produced no profile after %d attempt(s); last failure: %s",
+            self.max_attempts,
+            self._last_error,
+        )
+        return None
+
+    def _run_once(
+        self,
+        sequence: str,
+        name: Optional[str],
+        attempt: int,
+    ) -> Optional[TNPResult]:
+        """
+        Run TNP once, recording the failure cause on self._last_error.
+        运行一次 TNP，将失败原因记录在 self._last_error 上。
+
+        Returns / 返回:
+            Optional[TNPResult]: Parsed result, or None if this attempt failed.
+                解析后的结果，如果本次尝试失败则返回 None。
+        """
         # Generate unique name if not provided
         # 如果未提供，生成唯一名称
         seq_name = name or f"seq_{uuid.uuid4().hex[:8]}"
+        if attempt > 1:
+            # A fresh name per attempt keeps TNP's output files from colliding.
+            # 每次尝试使用新名称，避免 TNP 输出文件冲突。
+            seq_name = f"{seq_name}_r{attempt}"
 
         # Create temporary directory for output
         # 创建输出的临时目录
@@ -218,7 +267,7 @@ class TNPWrapper:
             ]
 
             try:
-                result = subprocess.run(
+                subprocess.run(
                     cmd,
                     capture_output=True,
                     text=True,
@@ -226,21 +275,46 @@ class TNPWrapper:
                     timeout=300,  # 5 minutes timeout
                 )
             except subprocess.CalledProcessError as e:
-                # TNP command failed
-                # TNP 命令失败
+                # TNP exits non-zero when it could not model the sequence, so its
+                # stderr is the only record of why. Keep it out of the return
+                # value but put it in the log.
+                # TNP 无法建模时以非零状态退出，其 stderr 是唯一的原因记录。
+                self._last_error = self._summarize(e.stderr) or f"exit {e.returncode}"
+                logger.warning(
+                    "TNP attempt %d failed (exit %s): %s",
+                    attempt, e.returncode, self._last_error,
+                )
                 return None
             except subprocess.TimeoutExpired:
-                # TNP timed out
-                # TNP 超时
+                self._last_error = "timed out after 300s"
+                logger.warning("TNP attempt %d timed out", attempt)
                 return None
             except FileNotFoundError:
-                # TNP not found
-                # 找不到 TNP
+                self._last_error = f"executable {self.tnp_executable!r} not found"
+                logger.error("TNP executable disappeared mid-run")
                 return None
 
             # Parse output JSON
             # 解析输出 JSON
-            return self._parse_output(output_dir, seq_name)
+            parsed = self._parse_output(output_dir, seq_name)
+            if parsed is None:
+                self._last_error = "TNP exited cleanly but wrote no usable profile"
+                logger.warning("TNP attempt %d: %s", attempt, self._last_error)
+            return parsed
+
+    @staticmethod
+    def _summarize(stderr: Optional[str], limit: int = 300) -> str:
+        """
+        Reduce a TNP traceback to its final, informative line.
+        将 TNP 的回溯信息缩减为最后一行有效信息。
+        """
+        if not stderr:
+            return ""
+        lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+        for line in reversed(lines):
+            if not line.startswith('File "') and "^" not in line:
+                return line[:limit]
+        return lines[-1][:limit] if lines else ""
 
     def _parse_output(
         self,
