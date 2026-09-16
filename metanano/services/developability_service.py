@@ -137,8 +137,16 @@ class DevelopabilityService:
         # 计算 TNP 分析结果
         profile = await self.compute_tnp_profile_async(sequence)
         if not profile:
+            # No profile means the TNP tool could not run to completion, which is
+            # a statement about the host and not about the molecule. "error" lets
+            # callers tell an infrastructure failure apart from a sequence that
+            # was measured and found undevelopable.
+            # 没有 profile 意味着 TNP 工具无法运行完成，这是关于主机的问题，
+            # 而不是关于分子的问题。"error" 让调用方区分基础设施故障与
+            # 已测量且不可开发的序列。
             return {
                 "passed": False,
+                "error": True,
                 "reason": "Failed to compute TNP profile. / 无法计算 TNP 分析结果。",
             }
 
