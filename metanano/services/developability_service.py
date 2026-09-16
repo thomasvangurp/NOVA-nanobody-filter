@@ -23,6 +23,7 @@ Consumers / 调用方:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from typing import Any, Dict, List, Optional, Tuple
 
 from metanano.config import DevelopabilityConfig
@@ -94,11 +95,10 @@ class DevelopabilityService:
         """
         await self.manager.initialize()
         async with self.manager.tnp_semaphore:
+            # Preserve execution/deadline policy in this diagnostic follow-up.
+            # Thread cancellation and shared retry budgets need separate review.
             return await asyncio.wait_for(
-                asyncio.to_thread(
-                    self._filter.compute_tnp_profile,
-                    sequence,
-                ),
+                asyncio.to_thread(self._filter.compute_tnp_profile, sequence),
                 timeout=self.manager.task_timeout,
             )
 
@@ -137,16 +137,15 @@ class DevelopabilityService:
         # 计算 TNP 分析结果
         profile = await self.compute_tnp_profile_async(sequence)
         if not profile:
-            # No profile means the TNP tool could not run to completion, which is
-            # a statement about the host and not about the molecule. "error" lets
-            # callers tell an infrastructure failure apart from a sequence that
-            # was measured and found undevelopable.
-            # 没有 profile 意味着 TNP 工具无法运行完成，这是关于主机的问题，
-            # 而不是关于分子的问题。"error" 让调用方区分基础设施故障与
-            # 已测量且不可开发的序列。
+            # No profile is a compute failure, not a measured developability
+            # verdict. It may be host-, input-, model- or parser-dependent;
+            # neither a CUDA cause nor sequence validity follows from it alone.
+            # "error" separates an unmeasured sequence from a biological red flag.
             return {
                 "passed": False,
                 "error": True,
+                "error_kind": "no_profile",
+                "sequence_sha256": hashlib.sha256(sequence.encode("utf-8")).hexdigest(),
                 "reason": "Failed to compute TNP profile. / 无法计算 TNP 分析结果。",
             }
 
@@ -199,14 +198,16 @@ class DevelopabilityService:
                 return_exceptions=True,
             )
 
-            for result in batch_results:
+            for sequence, result in zip(batch, batch_results):
                 if isinstance(result, Exception):
                     results.append({
                         "passed": False,
-                        "reason": f"Error: {str(result)}",
+                        "error": True,
+                        "error_kind": "timeout" if isinstance(result, TimeoutError) else "profile_exception",
+                        "sequence_sha256": hashlib.sha256(sequence.encode("utf-8")).hexdigest(),
+                        "reason": "Failed to compute TNP profile.",
                     })
                 else:
                     results.append(result)
 
         return results
-
